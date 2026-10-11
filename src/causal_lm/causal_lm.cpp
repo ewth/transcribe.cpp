@@ -132,6 +132,41 @@ bool kv_grow(KvCache & cache, ggml_backend_t backend, int n_ctx, int n_kv_heads,
     return true;
 }
 
+bool kv_grow_staged(KvCache & cache, ggml_backend_t backend, int n_ctx, int n_kv_heads, int head_dim, int n_layer) {
+    if (cache.self_k == nullptr || cache.n_batch != 1 || n_ctx <= cache.n_ctx) {
+        return false;
+    }
+    const ggml_type      type = cache.self_k->type;
+    const int            n    = cache.n;
+    const int            head = cache.head;
+    // Stage every layer's filled rows on the host, then release the device
+    // cache before allocating the larger one, so the device never holds both.
+    const size_t         row  = static_cast<size_t>(n_kv_heads) * head_dim * ggml_type_size(type);
+    const size_t         keep = static_cast<size_t>(std::min(n, cache.n_ctx)) * row;
+    std::vector<uint8_t> host(2 * static_cast<size_t>(n_layer) * keep);
+    for (int t = 0; t < 2 && keep > 0; ++t) {
+        ggml_tensor * src = t == 0 ? cache.self_k : cache.self_v;
+        for (int l = 0; l < n_layer; ++l) {
+            ggml_backend_tensor_get(src, host.data() + (static_cast<size_t>(t) * n_layer + l) * keep,
+                                    static_cast<size_t>(l) * cache.n_ctx * row, keep);
+        }
+    }
+    cache.free();
+    if (!kv_init(cache, backend, n_ctx, n_kv_heads, head_dim, n_layer, type)) {
+        return false;
+    }
+    for (int t = 0; t < 2 && keep > 0; ++t) {
+        ggml_tensor * dst = t == 0 ? cache.self_k : cache.self_v;
+        for (int l = 0; l < n_layer; ++l) {
+            ggml_backend_tensor_set(dst, host.data() + (static_cast<size_t>(t) * n_layer + l) * keep,
+                                    static_cast<size_t>(l) * n_ctx * row, keep);
+        }
+    }
+    cache.n    = n;
+    cache.head = head;
+    return true;
+}
+
 bool kv_init_batched(KvCache &      cache,
                      ggml_backend_t backend,
                      int            n_ctx,

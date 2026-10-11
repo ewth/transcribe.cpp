@@ -266,6 +266,21 @@ transcribe_apply_warnings(transcribe_prefill_chunk_mask_unit)
 add_test(NAME transcribe_prefill_chunk_mask_unit COMMAND transcribe_prefill_chunk_mask_unit)
 
 # -----------------------------------------------------------------------------
+# KV cache growth through a host staging buffer (CPU backend, no model)
+
+add_executable(transcribe_kv_grow_staged_unit
+    kv_grow_staged_unit.cpp)
+
+target_link_libraries(transcribe_kv_grow_staged_unit PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_kv_grow_staged_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_kv_grow_staged_unit)
+
+add_test(NAME transcribe_kv_grow_staged_unit COMMAND transcribe_kv_grow_staged_unit)
+
+# -----------------------------------------------------------------------------
 # Per-run decode budget rule (pure host, no model)
 
 add_executable(transcribe_decode_budget_unit

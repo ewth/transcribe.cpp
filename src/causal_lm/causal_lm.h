@@ -107,6 +107,13 @@ bool kv_init_batched(KvCache &      cache,
 // known up front. On failure (allocation) the old cache is left intact.
 bool kv_grow(KvCache & cache, ggml_backend_t backend, int n_ctx, int n_kv_heads, int head_dim, int n_layer);
 
+// As kv_grow, but the filled rows are staged on the host and the old cache is
+// freed before the new one is allocated, so the device never holds both: peak
+// device memory is the new cache alone, at the cost of a host round trip. For
+// caches large enough that old + new does not fit. On failure (allocation)
+// the cache is left freed (ctx == nullptr) and its contents are lost.
+bool kv_grow_staged(KvCache & cache, ggml_backend_t backend, int n_ctx, int n_kv_heads, int head_dim, int n_layer);
+
 struct BlockOpts {
     bool use_flash = true;
 

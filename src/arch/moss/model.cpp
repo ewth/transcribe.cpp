@@ -262,6 +262,11 @@ transcribe_status moss_prompt_suffix(const MossModel &             m,
 
 constexpr const char k_default_variant[] = "moss-transcribe-diarize";
 constexpr int        k_max_new           = 256;
+// Decode tokens the KV cache is first sized for, and how far the attention
+// width (and, when it is the limit, the cache) widens each time generation
+// outruns it.
+constexpr int        k_initial_gen       = 1024;
+constexpr int        k_kv_grow_step      = 4096;
 
 // Token room for the hotword hint: what the context window leaves after the
 // generation reserve and a prompt of `base_prompt_len` tokens built with the
@@ -861,7 +866,12 @@ transcribe_status run(transcribe_session *          session,
     // 1K/2K/4K buckets; longer ones grow in 4K steps so crossing 32K does not
     // jump straight to the full 131072-token, ~14 GiB worst case. Still
     // grow-only, so repeat runs on one session reuse the largest allocation.
-    const int want_n_ctx = causal_lm::pick_kv_cache_context(T_prompt + gen_budget, ceiling);
+    // Only the first k_initial_gen tokens of the decode budget are allocated
+    // up front: the budget is about twice what a transcript emits, and on a
+    // long recording reserving all of it costs gigabytes the decode never
+    // touches. The step loop grows the cache when generation outruns it.
+    // Budgets within k_initial_gen (clips up to ~35 s) are sized as before.
+    const int want_n_ctx = causal_lm::pick_kv_cache_context(T_prompt + std::min(gen_budget, k_initial_gen), ceiling);
     if (cc->kv_cache.ctx != nullptr && cc->kv_cache.n_ctx < want_n_ctx) {
         cc->kv_cache.free();
     }
@@ -976,24 +986,31 @@ transcribe_status run(transcribe_session *          session,
     const int32_t eos_id   = cm->hparams.eos_token_id;
     int           cur_past = T_prompt;
     int           max_n_kv = 1024;
-    while (max_n_kv < T_prompt + gen_budget) {
+    while (max_n_kv < T_prompt + std::min(gen_budget, k_initial_gen)) {
         max_n_kv *= 2;
     }
     if (max_n_kv > cc->kv_cache.n_ctx) {
         max_n_kv = cc->kv_cache.n_ctx;
     }
 
-    if (const transcribe_status st = reset_compute_ctx(cc, 8); st != TRANSCRIBE_OK) {
+    // (Re)build the step graph for an attention width of max_n_kv.
+    StepBuild  sb;
+    const auto build_step = [&]() -> transcribe_status {
+        if (const transcribe_status st = reset_compute_ctx(cc, 8); st != TRANSCRIBE_OK) {
+            return st;
+        }
+        sb = build_step_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, max_n_kv, cc->decoder_use_flash);
+        if (sb.graph == nullptr || sb.out == nullptr) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        ggml_backend_sched_reset(cc->sched);
+        if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
+            return TRANSCRIBE_ERR_OOM;
+        }
+        return TRANSCRIBE_OK;
+    };
+    if (const transcribe_status st = build_step(); st != TRANSCRIBE_OK) {
         return st;
-    }
-    StepBuild sb =
-        build_step_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, max_n_kv, cc->decoder_use_flash);
-    if (sb.graph == nullptr || sb.out == nullptr) {
-        return TRANSCRIBE_ERR_GGUF;
-    }
-    ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
-        return TRANSCRIBE_ERR_OOM;
     }
 
     const ggml_fp16_t        mz = ggml_fp32_to_fp16(0.0f);
@@ -1015,7 +1032,31 @@ transcribe_status run(transcribe_session *          session,
     }
 
     bool repeating = false;
-    while (next_tok != eos_id && static_cast<int32_t>(generated_ids.size()) < gen_budget && cur_past + 1 <= max_n_kv) {
+    while (next_tok != eos_id && static_cast<int32_t>(generated_ids.size()) < gen_budget) {
+        if (cur_past + 1 > max_n_kv) {
+            // Out of attention width: widen by one step, growing the KV cache
+            // first when it is the limit. Staged so the device never holds the
+            // old and the new cache at once.
+            if (max_n_kv >= ceiling) {
+                break;
+            }
+            max_n_kv = std::min(max_n_kv + k_kv_grow_step, ceiling);
+            if (cc->kv_cache.n_ctx < max_n_kv) {
+                const int grow_to = causal_lm::pick_kv_cache_context(max_n_kv, ceiling);
+                if (!causal_lm::kv_grow_staged(cc->kv_cache, cm->plan.primary, grow_to, cm->hparams.dec_n_kv_heads,
+                                               cm->hparams.dec_head_dim, cm->hparams.dec_n_layers)) {
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                            "moss run: KV cache growth to %d positions failed — out of memory. "
+                            "Lower transcribe_session_params.n_ctx or shorten the audio.",
+                            grow_to);
+                    return TRANSCRIBE_ERR_OOM;
+                }
+            }
+            if (const transcribe_status st = build_step(); st != TRANSCRIBE_OK) {
+                return st;
+            }
+            step_mask.resize(max_n_kv, mn);
+        }
         const int64_t t_i0 = perf_debug ? ggml_time_us() : 0;
         ggml_backend_tensor_set(sb.input_id_in, &next_tok, 0, sizeof(int32_t));
         const int32_t pos_val = cur_past;
